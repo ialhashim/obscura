@@ -7677,6 +7677,17 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLEmbedElement;
   }
+  if (tag === "OBJECT" && globalThis.HTMLObjectElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis.HTMLObjectElement;
+  }
+  if (tag === "FRAME" && globalThis.HTMLFrameElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis.HTMLFrameElement;
+  }
+  if (tag === "CAPTION" && globalThis.HTMLTableCaptionElement) return globalThis.HTMLTableCaptionElement;
+  if ((tag === "TD" || tag === "TH") && globalThis.HTMLTableCellElement) return globalThis.HTMLTableCellElement;
+  if (tag === "TR" && globalThis.HTMLTableRowElement) return globalThis.HTMLTableRowElement;
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -7702,6 +7713,11 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
     if (tag === "EMBED" && globalThis.HTMLEmbedElement) return globalThis.HTMLEmbedElement;
+    if (tag === "OBJECT" && globalThis.HTMLObjectElement) return globalThis.HTMLObjectElement;
+    if (tag === "FRAME" && globalThis.HTMLFrameElement) return globalThis.HTMLFrameElement;
+    if (tag === "CAPTION" && globalThis.HTMLTableCaptionElement) return globalThis.HTMLTableCaptionElement;
+    if ((tag === "TD" || tag === "TH") && globalThis.HTMLTableCellElement) return globalThis.HTMLTableCellElement;
+    if (tag === "TR" && globalThis.HTMLTableRowElement) return globalThis.HTMLTableRowElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -14067,6 +14083,11 @@ globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {
 // navigation. Keep its standard constructor surface and a distinct <embed>
 // brand, matching the normal browser model.
 globalThis.HTMLEmbedElement = class HTMLEmbedElement extends Element {};
+globalThis.HTMLObjectElement = class HTMLObjectElement extends Element {};
+globalThis.HTMLFrameElement = class HTMLFrameElement extends Element {};
+globalThis.HTMLTableCaptionElement = class HTMLTableCaptionElement extends Element {};
+globalThis.HTMLTableCellElement = class HTMLTableCellElement extends Element {};
+globalThis.HTMLTableRowElement = class HTMLTableRowElement extends Element {};
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;
