@@ -415,7 +415,7 @@ async function __fetchDynClassicScript(task) {
       "sec-fetch-site": fetchSite,
     });
     const raw = await __obscuraCore.ops.op_fetch_url(
-      task.url, "GET", headers, new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script"
+      task.url, "GET", headers, new Uint8Array(0), task.pageOrigin, "no-cors", "include", "Script"
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -653,7 +653,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   }
   seen.add(url);
   const raw = await __obscuraCore.ops.op_fetch_url(
-    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", "Stylesheet"
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "include", "Stylesheet"
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
