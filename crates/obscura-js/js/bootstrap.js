@@ -394,8 +394,28 @@ async function __fetchDynClassicScript(task) {
   if (task.url.startsWith('data:')) {
     body = _decodeDataScriptUrl(task.url);
   } else {
+    // Dynamic <script src> loads are browser subresource requests, not page
+    // fetch() calls.  Send their observable request context through the
+    // internal transport as well: some origin/CDN pairs select the script
+    // representation only when the destination and referrer identify it as a
+    // script.  This deliberately lives in the browser-owned loader rather
+    // than exposing otherwise forbidden request headers to page JavaScript.
+    let documentUrl = _domParse("document_url") || globalThis.location?.href || "";
+    let fetchSite = "none";
+    try {
+      const source = new URL(documentUrl);
+      const target = new URL(task.url);
+      fetchSite = source.origin === target.origin ? "same-origin" : "cross-site";
+    } catch (_) {}
+    const headers = JSON.stringify({
+      "accept": "*/*",
+      "referer": documentUrl,
+      "sec-fetch-dest": "script",
+      "sec-fetch-mode": "no-cors",
+      "sec-fetch-site": fetchSite,
+    });
     const raw = await __obscuraCore.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script"
+      task.url, "GET", headers, new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script"
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
