@@ -6671,7 +6671,7 @@ pub fn max_live_frames() -> usize {
 }
 
 /// Initial blank and srcdoc documents share their creator's realm setup.
-#[op2]
+#[op2(reentrant)]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
