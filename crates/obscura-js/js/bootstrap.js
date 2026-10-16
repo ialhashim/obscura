@@ -7673,6 +7673,10 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLIFrameElement;
   }
+  if (tag === "EMBED" && globalThis.HTMLEmbedElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis.HTMLEmbedElement;
+  }
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -7697,6 +7701,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (localName === "meta" && globalThis.HTMLMetaElement) return globalThis.HTMLMetaElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
+    if (tag === "EMBED" && globalThis.HTMLEmbedElement) return globalThis.HTMLEmbedElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -14058,6 +14063,10 @@ globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {
   get srcdoc() { return this.getAttribute('srcdoc') || ''; }
   set srcdoc(value) { this.setAttribute('srcdoc', value); }
 };
+// SAB's telemetry runtime feature-detects embedded plugin nodes on each
+// navigation. Keep its standard constructor surface and a distinct <embed>
+// brand, matching the normal browser model.
+globalThis.HTMLEmbedElement = class HTMLEmbedElement extends Element {};
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;
