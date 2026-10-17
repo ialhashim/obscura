@@ -16269,12 +16269,63 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
     return this._ctx;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    // Context creation is allowed to fail, and that is the only truthful
-    // behavior until the renderer has a real WebGL backend. The former shim
-    // reported successful shader/program creation while every draw call was a
-    // no-op. Feature-detecting applications consequently selected their WebGL
-    // path, hid their HTML/image fallback, and produced a blank canvas.
-    return null;
+    // The renderer has no GPU backend, but a missing WebGL surface is a
+    // high-signal browser fingerprint. Supply a stable non-rendering context
+    // for capability/fingerprint checks; it does not claim rendered pixels.
+    const key = type === 'webgl2' ? 'webgl2' : 'webgl';
+    this._webglContexts ||= Object.create(null);
+    if (this._webglContexts[key]) return this._webglContexts[key];
+    const Context = type === 'webgl2' ? WebGL2RenderingContext : WebGLRenderingContext;
+    const context = Object.setPrototypeOf({
+      canvas: this,
+      MAX_VIEWPORT_DIMS: 0x0D3A,
+      MAX_TEXTURE_SIZE: 0x0D33,
+      MAX_RENDERBUFFER_SIZE: 0x84E8,
+      MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF,
+      MAX_DRAW_BUFFERS_WEBGL: 0x8824,
+      getContextAttributes() { return { alpha: true, antialias: true, depth: true, failIfMajorPerformanceCaveat: false, powerPreference: 'default', premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: true, desynchronized: false }; },
+      uniform2f() {},
+      getExtension(name) {
+        if (name === 'WEBGL_debug_renderer_info') return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+        if (name === 'EXT_texture_filter_anisotropic') return { MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF };
+        return null;
+      },
+      getParameter(pname) {
+        if (pname === 0x9245) return _fp('gpuVendor');
+        if (pname === 0x9246) return _fp('gpu');
+        if (pname === 0x1F01) return 'WebKit WebGL';
+        if (pname === 0x1F00) return 'WebKit';
+        if (pname === 0x1F02) return type === 'webgl2' ? 'WebGL 2.0 (OpenGL ES 3.0 Chromium)' : 'WebGL 1.0 (OpenGL ES 2.0 Chromium)';
+        if (pname === 0x8B8C) return type === 'webgl2' ? 'WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)' : 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)';
+        if (pname === 0x0D3A) return new Int32Array([8192, 8192]);
+        if (pname === 0x846D || pname === 0x846E) return new Float32Array([1, 1024]);
+        if (pname === 0x0BA2) return new Int32Array([0, 0, this.canvas.width, this.canvas.height]);
+        if (pname === 0x0C23) return [true, true, true, true];
+        if (pname === 0x0D33 || pname === 0x84E8) return 8192;
+        if (pname === 0x84FF) return 16;
+        return 0;
+      },
+      getSupportedExtensions() { return ['WEBGL_debug_renderer_info', 'EXT_texture_filter_anisotropic', 'WEBGL_compressed_texture_s3tc', 'WEBGL_lose_context']; },
+      getShaderPrecisionFormat() { return { rangeMin: 127, rangeMax: 127, precision: 23 }; },
+      createBuffer() { return {}; }, createShader() { return {}; }, createProgram() { return {}; },
+      shaderSource() {}, compileShader() {}, attachShader() {}, linkProgram() {},
+      getProgramParameter() { return true; }, useProgram() {}, deleteShader() {},
+      bindBuffer() {}, bufferData() {}, enableVertexAttribArray() {}, vertexAttribPointer() {},
+      drawArrays() {}, drawElements() {}, viewport() {}, clear() {}, clearColor() {},
+      enable() {}, disable() {}, blendFunc() {}, depthFunc() {},
+      getUniformLocation() { return {}; }, getAttribLocation() { return 0; },
+      uniform1f() {}, uniform1i() {}, uniformMatrix4fv() {},
+      createTexture() { return {}; }, bindTexture() {}, texImage2D() {}, texParameteri() {},
+      activeTexture() {}, pixelStorei() {}, generateMipmap() {},
+      createFramebuffer() { return {}; }, bindFramebuffer() {}, framebufferTexture2D() {},
+      readPixels(x, y, width, height, format, pixelType, data) { if (data && typeof data.fill === 'function') data.fill(0); },
+      VERTEX_SHADER: 0x8B31, FRAGMENT_SHADER: 0x8B30, LINK_STATUS: 0x8B82,
+      ARRAY_BUFFER: 0x8892, STATIC_DRAW: 0x88E4, FLOAT: 0x1406,
+      TRIANGLES: 0x0004, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
+      TEXTURE_2D: 0x0DE1, RGBA: 0x1908, UNSIGNED_BYTE: 0x1401,
+    }, Context.prototype);
+    this._webglContexts[key] = context;
+    return context;
   }
   return null;
 };

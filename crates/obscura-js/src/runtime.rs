@@ -16887,7 +16887,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_webgl_context_does_not_claim_success() {
+    fn webgl_fingerprint_surface_is_stable_without_rendering_pixels() {
         let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
         let result = rt
             .evaluate(
@@ -16895,14 +16895,21 @@ mod tests {
                 (() => {
                     const canvas = document.querySelector('canvas');
                     const fallback = document.createElement('p');
-                    if (!canvas.getContext('webgl')) {
+                    const webgl = canvas.getContext('webgl');
+                    const webgl2 = canvas.getContext('webgl2');
+                    if (!webgl) {
                         fallback.textContent = 'static fallback';
                         document.body.appendChild(fallback);
                     }
+                    const debug = webgl.getExtension('WEBGL_debug_renderer_info');
                     return [
-                        canvas.getContext('webgl'),
-                        canvas.getContext('webgl2'),
-                        canvas.getContext('experimental-webgl'),
+                        webgl instanceof WebGLRenderingContext,
+                        webgl2 instanceof WebGL2RenderingContext,
+                        canvas.getContext('webgl') === webgl,
+                        canvas.getContext('experimental-webgl') === webgl,
+                        typeof webgl.getParameter(debug.UNMASKED_VENDOR_WEBGL) === 'string',
+                        typeof webgl.getParameter(debug.UNMASKED_RENDERER_WEBGL) === 'string',
+                        Array.from(webgl.getParameter(webgl.MAX_VIEWPORT_DIMS)),
                         fallback.isConnected,
                         fallback.textContent,
                     ];
@@ -16912,7 +16919,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!([null, null, null, true, "static fallback"])
+            serde_json::json!([true, true, true, true, true, true, [8192, 8192], false, ""])
         );
     }
 
