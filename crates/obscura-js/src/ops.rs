@@ -3476,10 +3476,11 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
-/// Fetch "append a request `Origin` header": cross-origin requests and any
-/// request whose method is neither GET nor HEAD carry the requester's origin.
-fn sends_origin_header(method: &str, cross_origin: bool) -> bool {
-    cross_origin || !matches!(method, "GET" | "HEAD")
+/// A classic cross-origin script is fetched in `no-cors` mode. Chrome does
+/// not attach `Origin` to that safe GET. Sending one makes SAB return its
+/// HTML fallback for legacy script URLs rather than the redirected JavaScript.
+fn sends_origin_header(method: &str, cross_origin: bool, mode: &str) -> bool {
+    !matches!(method, "GET" | "HEAD") || (cross_origin && mode == "cors")
 }
 
 /// Strip headers that must not survive a redirect. On a redirect that changes
@@ -4304,7 +4305,7 @@ async fn fetch_url_inner(
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
         crossed_origin |= current_is_cross_origin;
-        if sends_origin_header(current_method.as_str(), current_is_cross_origin) {
+        if sends_origin_header(current_method.as_str(), current_is_cross_origin, &mode) {
             req = req.header("Origin", &page_origin);
         }
 
@@ -4627,7 +4628,7 @@ async fn stealth_fetch_all(
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         crossed_origin |= current_is_cross_origin;
-        if sends_origin_header(&current_method, current_is_cross_origin) {
+        if sends_origin_header(&current_method, current_is_cross_origin, &mode) {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         for (k, v) in &current_headers {
@@ -4844,10 +4845,18 @@ mod tests {
         cors_unsafe_request_header_names,
         glob_match, is_cors_safelisted_content_type, is_cors_safelisted_request_header,
         parse_cors_header_list, preflight_allows_header, preflight_allows_method,
-        sanitize_redirect_headers, validate_fetch_url,
+        sanitize_redirect_headers, sends_origin_header, validate_fetch_url,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn origin_header_matches_classic_script_and_cors_fetch_semantics() {
+        assert!(!sends_origin_header("GET", true, "no-cors"));
+        assert!(!sends_origin_header("HEAD", true, "no-cors"));
+        assert!(sends_origin_header("GET", true, "cors"));
+        assert!(sends_origin_header("POST", false, "no-cors"));
+    }
 
     // #678: Web Storage lives in Rust, keyed by origin, so these pin the
     // behaviour the realm-local object could not provide.
