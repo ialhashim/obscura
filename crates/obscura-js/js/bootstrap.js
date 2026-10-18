@@ -5219,7 +5219,7 @@ class Element extends Node {
     try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
     __obscuraCore.ops.op_fetch_url(
       fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
-      'no-cors', 'same-origin', 'Document'
+      'no-cors', 'include', 'Document'
     ).then(raw => {
       if (el._iframeLoadingUrl !== fullUrl) return;
       const response = JSON.parse(raw);
@@ -11719,7 +11719,7 @@ globalThis.MouseEvent = class extends Event {
   }
 };
 globalThis.KeyboardEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat;this.keyCode=o.keyCode||0;this.charCode=o.charCode||0;this.which=o.which||0; }
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat;this.isComposing=!!o.isComposing;this.keyCode=o.keyCode||0;this.charCode=o.charCode||0;this.which=o.which||0; }
   getModifierState(key) {
     switch (String(key)) {
       case 'Alt': return this.altKey;
@@ -14086,6 +14086,10 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   }
   set cols(v) { this.setAttribute('cols', String(v)); }
 };
+// Match Chromium's own value descriptor. SDKs patch textarea values through
+// HTMLTextAreaElement.prototype and fail if the descriptor is only inherited.
+Object.defineProperty(HTMLTextAreaElement.prototype, 'value',
+  Object.getOwnPropertyDescriptor(Element.prototype, 'value'));
 globalThis.HTMLLabelElement = Element;
 for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
   Object.defineProperty(proto, 'readOnly', { enumerable: true });
@@ -16842,10 +16846,51 @@ globalThis.Worker = class Worker {
   }
   _makeScope() {
     const worker = this;
+    // A worker has its own Navigator interface and objects, not the creator's
+    // Window navigator. Copy the configured identity without DOM-only APIs.
+    const creatorNavigator = globalThis.navigator;
+    function WorkerNavigator() { throw new TypeError('Illegal constructor'); }
+    _markNative(WorkerNavigator);
+    Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, {
+      value: 'WorkerNavigator', configurable: true,
+    });
+    const workerNavigator = Object.create(WorkerNavigator.prototype);
+    const navigatorValue = (name, value) => {
+      const get = _markNative(function() {
+        if (this !== workerNavigator) throw new TypeError('Illegal invocation');
+        return value;
+      });
+      Object.defineProperty(WorkerNavigator.prototype, name, {
+        get, enumerable: true, configurable: true,
+      });
+    };
+    for (const name of ['appVersion', 'platform', 'product', 'userAgent',
+                        'language', 'onLine', 'hardwareConcurrency', 'deviceMemory']) {
+      navigatorValue(name, creatorNavigator[name]);
+    }
+    navigatorValue('appCodeName', creatorNavigator.appCodeName || 'Mozilla');
+    navigatorValue('appName', creatorNavigator.appName || 'Netscape');
+    navigatorValue('languages', Object.freeze(Array.from(creatorNavigator.languages || [])));
+    if (creatorNavigator.userAgentData) {
+      const creatorData = creatorNavigator.userAgentData;
+      const brands = creatorData.brands.map(({ brand, version }) => ({ brand, version }));
+      const mobile = creatorData.mobile, platform = creatorData.platform;
+      const highEntropyValues = creatorData.getHighEntropyValues.bind(creatorData);
+      navigatorValue('userAgentData', {
+        get brands() { return brands.map(({ brand, version }) => ({ brand, version })); },
+        get mobile() { return mobile; },
+        get platform() { return platform; },
+        getHighEntropyValues(hints) {
+          return highEntropyValues(hints).then(value => _structuredClone(value, new Map()));
+        },
+        toJSON() { return { brands: this.brands, mobile, platform }; },
+      });
+    }
     const scope = {
       onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
+      WorkerNavigator,
       importScripts: (...values) => {
         const scripts = values.map(value => {
           if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol to a string');
@@ -16909,6 +16954,10 @@ globalThis.Worker = class Worker {
       window: undefined,
       document: undefined,
     };
+    Object.defineProperty(scope, 'navigator', {
+      get: _markNative(function() { return workerNavigator; }),
+      enumerable: true, configurable: true,
+    });
     scope.self = scope;
     scope.globalThis = scope;
     for (const name of [
@@ -17403,10 +17452,16 @@ if (!globalThis.crypto.subtle) {
   // Real WebCrypto for the secret-key algorithms sites actually use: HMAC,
   // AES-GCM/CBC/CTR, PBKDF2 and HKDF, plus raw/JWK-oct key handling. The crypto
   // itself runs in Rust ops (RustCrypto); this shim only marshals bytes and
-  // normalizes algorithm parameters. Public-key algorithms (RSA*, ECDSA, ECDH)
-  // and non-symmetric key formats (pkcs8/spki) are not implemented and throw
-  // NotSupportedError rather than returning fake data.
+  // normalizes algorithm parameters. Stealth builds also provide real
+  // RSASSA-PKCS1-v1_5 generation/signing through their BoringSSL provider.
+  // Unsupported public-key algorithms/formats still throw NotSupportedError.
   const keyMaterial = new WeakMap();
+  const rsaAlgorithms = new WeakMap();
+  function rsaAlgorithmCopy(algorithm) {
+    return { name: algorithm.name, modulusLength: algorithm.modulusLength,
+      publicExponent: new Uint8Array(algorithm.publicExponent), hash: { name: algorithm.hash.name } };
+  }
+  function keyAlgorithm(key) { return rsaAlgorithms.get(key) || key.algorithm; }
 
   class CryptoKey {
     constructor() { throw new TypeError("Illegal constructor"); }
@@ -17414,6 +17469,12 @@ if (!globalThis.crypto.subtle) {
   }
   function makeKey(type, extractable, algorithm, usages, bytes) {
     const k = Object.create(CryptoKey.prototype);
+    // The public algorithm object is mutable; it must not change the algorithm
+    // bound to the private key or alter its structured-clone/IndexedDB state.
+    if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+      rsaAlgorithms.set(k, rsaAlgorithmCopy(algorithm));
+      algorithm = rsaAlgorithmCopy(algorithm);
+    }
     Object.defineProperty(k, "type", { value: type, enumerable: true });
     Object.defineProperty(k, "extractable", { value: !!extractable, enumerable: true });
     Object.defineProperty(k, "algorithm", { value: algorithm, enumerable: true });
@@ -17429,7 +17490,7 @@ if (!globalThis.crypto.subtle) {
   }
   _idbPlatformCodecs.push({
     name:"CryptoKey", test:key => keyMaterial.has(key),
-    encode:key => ({type:key.type,extractable:key.extractable,algorithm:key.algorithm,usages:key.usages,bytes:keyBytes(key)}),
+    encode:key => ({type:key.type,extractable:key.extractable,algorithm:keyAlgorithm(key),usages:key.usages,bytes:keyBytes(key)}),
     decode:data => makeKey(data.type,data.extractable,data.algorithm,data.usages,data.bytes),
   });
   // A CryptoKey cloned via structuredClone or postMessage is a different
@@ -17444,7 +17505,7 @@ if (!globalThis.crypto.subtle) {
   // material is registered once), matching structuredClone's identity rules.
   globalThis.__obscura_clone_hooks["CryptoKey"] = function (src, seen) {
     if (seen && seen.has(src)) return seen.get(src);
-    const copy = makeKey(src.type, src.extractable, src.algorithm, src.usages, keyBytes(src));
+    const copy = makeKey(src.type, src.extractable, keyAlgorithm(src), src.usages, keyBytes(src));
     if (seen) seen.set(src, copy);
     return copy;
   };
@@ -17456,7 +17517,7 @@ if (!globalThis.crypto.subtle) {
       if (!keyMaterial.has(key)) return null;
       return {
         kind: 'CryptoKey', type: key.type, extractable: key.extractable,
-        algorithm: key.algorithm, usages: key.usages, bytes: keyBytes(key),
+        algorithm: keyAlgorithm(key), usages: key.usages, bytes: keyBytes(key),
       };
     },
     decode(data) {
@@ -17561,6 +17622,28 @@ if (!globalThis.crypto.subtle) {
     async exportKey(format, key) {
       const bytes = keyBytes(key);
       if (!key.extractable) throw new DOMException("Key is not extractable", "InvalidAccessError");
+      const algorithm = keyAlgorithm(key);
+      if (algorithm.name === "RSASSA-PKCS1-v1_5") {
+        if (format === "spki" && key.type === "public") return bufferOf(bytes);
+        if (format === "pkcs8" && key.type === "private") {
+          if (typeof __obscuraCore.ops.op_subtle_rsa_export_private !== "function")
+            throw new DOMException("RSA provider is unavailable", "NotSupportedError");
+          // Private material is a native authenticated capsule, not DER.
+          // Native export enforces the sealed permission independently of JS.
+          return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_rsa_export_private(bytes)));
+        }
+        if (format === "jwk" && key.type === "public") {
+          if (typeof __obscuraCore.ops.op_subtle_rsa_public_components !== "function")
+            throw new DOMException("RSA provider is unavailable", "NotSupportedError");
+          const parts = runOp(() => __obscuraCore.ops.op_subtle_rsa_public_components(bytes));
+          const jwk = { kty: "RSA", n: bytesToB64url(parts.modulus), e: bytesToB64url(parts.exponent),
+            ext: true, key_ops: key.usages.slice() };
+          const jose = { "SHA-1": "RS1", "SHA-256": "RS256", "SHA-384": "RS384", "SHA-512": "RS512" };
+          jwk.alg = jose[algorithm.hash.name];
+          return jwk;
+        }
+        throw new DOMException("Unsupported RSA export format for this key type", "NotSupportedError");
+      }
       if (format === "raw") return bufferOf(bytes);
       if (format === "jwk") {
         const jwk = { kty: "oct", k: bytesToB64url(bytes), ext: key.extractable, key_ops: key.usages.slice() };
@@ -17576,6 +17659,29 @@ if (!globalThis.crypto.subtle) {
 
     async generateKey(algorithm, extractable, keyUsages) {
       const alg = normalizeAlgo(algorithm);
+      if (alg.name === "RSASSA-PKCS1-v1_5") {
+        if (typeof __obscuraCore.ops.op_subtle_rsa_generate !== "function")
+          throw new DOMException("RSA provider is unavailable", "NotSupportedError");
+        const hash = normalizeHash(alg.hash);
+        const usages = Array.from(keyUsages || []);
+        if (usages.some(usage => usage !== "sign" && usage !== "verify") || !usages.includes("sign"))
+          throw new DOMException("Invalid or empty private RSA key usages", "SyntaxError");
+        if (!(alg.publicExponent instanceof Uint8Array)) throw new TypeError("publicExponent must be a Uint8Array");
+        const exponent = new Uint8Array(alg.publicExponent);
+        const bits = Number(alg.modulusLength);
+        if (!Number.isInteger(bits) || bits < 1024 || bits > 8192)
+          throw new DOMException("Unsupported RSA modulus length", "OperationError");
+        const privateExtractable = !!extractable;
+        let pair;
+        try { pair = await __obscuraCore.ops.op_subtle_rsa_generate(bits, exponent, hash, privateExtractable); }
+        catch (_) { throw new DOMException("RSA key generation failed", "OperationError"); }
+        const keyAlg = { name: alg.name, modulusLength: bits,
+          publicExponent: new Uint8Array(pair.exponent), hash: { name: hash } };
+        return {
+          publicKey: makeKey("public", true, keyAlg, usages.includes("verify") ? ["verify"] : [], new Uint8Array(pair.publicKey)),
+          privateKey: makeKey("private", privateExtractable, keyAlg, ["sign"], new Uint8Array(pair.privateKey)),
+        };
+      }
       if (alg.name === "HMAC") {
         const hash = normalizeHash(alg.hash);
         const len = alg.length ? Math.ceil(alg.length / 8) : hashBlockSize(hash);
@@ -17595,6 +17701,15 @@ if (!globalThis.crypto.subtle) {
     async sign(algorithm, key, data) {
       const alg = normalizeAlgo(algorithm);
       const bytes = keyBytes(key);
+      const storedAlgorithm = keyAlgorithm(key);
+      if (storedAlgorithm.name !== alg.name || !key.usages.includes("sign"))
+        throw new DOMException("Key does not permit this signing algorithm", "InvalidAccessError");
+      if (alg.name === "RSASSA-PKCS1-v1_5") {
+        if (key.type !== "private") throw new DOMException("RSA signing requires a private key", "InvalidAccessError");
+        if (typeof __obscuraCore.ops.op_subtle_rsa_sign !== "function")
+          throw new DOMException("RSA provider is unavailable", "NotSupportedError");
+        return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_rsa_sign(storedAlgorithm.hash.name, bytes, toBytes(data))));
+      }
       if (alg.name === "HMAC") {
         const hash = key.algorithm && key.algorithm.hash ? key.algorithm.hash.name : normalizeHash(alg.hash);
         return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_hmac(hash, bytes, toBytes(data))));
@@ -17605,6 +17720,15 @@ if (!globalThis.crypto.subtle) {
     async verify(algorithm, key, signature, data) {
       const alg = normalizeAlgo(algorithm);
       const bytes = keyBytes(key);
+      const storedAlgorithm = keyAlgorithm(key);
+      if (storedAlgorithm.name !== alg.name || !key.usages.includes("verify"))
+        throw new DOMException("Key does not permit this verification algorithm", "InvalidAccessError");
+      if (alg.name === "RSASSA-PKCS1-v1_5") {
+        if (key.type !== "public") throw new DOMException("RSA verification requires a public key", "InvalidAccessError");
+        if (typeof __obscuraCore.ops.op_subtle_rsa_verify !== "function")
+          throw new DOMException("RSA provider is unavailable", "NotSupportedError");
+        return runOp(() => __obscuraCore.ops.op_subtle_rsa_verify(storedAlgorithm.hash.name, bytes, toBytes(signature), toBytes(data)));
+      }
       if (alg.name === "HMAC") {
         const hash = key.algorithm && key.algorithm.hash ? key.algorithm.hash.name : normalizeHash(alg.hash);
         const mac = runOp(() => __obscuraCore.ops.op_subtle_hmac(hash, bytes, toBytes(data)));

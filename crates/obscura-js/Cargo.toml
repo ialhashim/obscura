@@ -10,7 +10,7 @@ default = []
 # Builds obscura-net with its stealth (wreq) HTTP client and lets scripted
 # fetch()/XHR be routed through it so JS-level requests carry the same Chrome
 # TLS fingerprint and client hints as stealth navigation.
-stealth = ["obscura-net/stealth"]
+stealth = ["obscura-net/stealth", "dep:btls"]
 # Builds the obscura-render layout layer and exposes real box geometry to JS
 # (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
 # rasterizes screenshots. Off by default so the scraping build stays lean.
@@ -52,3 +52,12 @@ hkdf = "0.12"
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
 obscura-render = { workspace = true, optional = true }
+
+# Reuse the native provider already used by the stealth transport. Match
+# obscura-net's target-specific symbol policy without adding BoringSSL to
+# builds that do not enable stealth.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+btls = { version = "=0.5.6", optional = true, features = ["prefix-symbols"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]
+btls = { version = "=0.5.6", optional = true }

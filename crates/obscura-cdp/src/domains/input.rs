@@ -10,6 +10,26 @@ fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+// CDP keyDown includes the character phase; rawKeyDown leaves it to a later
+// char event. The cancelable keypress runs before either editing event.
+fn printable_keypress_js(text: &str, key: &str, code: &str, modifiers: u64, repeat: bool, location: u64) -> String {
+    let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
+    let character_code = text.chars().next().map(u32::from).unwrap_or(0);
+    format!(
+        "(function() {{\
+            var target = document.activeElement || document.body;\
+            if (!target) return false;\
+            return target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {{\
+                bubbles:true,cancelable:true,composed:true,view:globalThis,isComposing:false,\
+                key:{key},code:{code},keyCode:{character_code},which:{character_code},charCode:{character_code},\
+                altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},repeat:{repeat},location:{location}\
+            }})));\
+        }})()",
+        key = js_str(if key.is_empty() { text } else { key }),
+        code = js_str(code),
+    )
+}
+
 // Insert `text` at the caret, replacing any non-collapsed selection the way a
 // real browser does when you type over selected text (for example after a
 // triple-click select-all). selectionStart is null during ordinary typing, so
@@ -423,6 +443,8 @@ pub async fn handle(
                 .get("windowsVirtualKeyCode")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            let repeat = params.get("autoRepeat").and_then(|v| v.as_bool()).unwrap_or(false);
+            let location = params.get("location").and_then(|v| v.as_u64()).unwrap_or(0);
 
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 match event_type {
@@ -430,7 +452,7 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,isComposing:false,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},repeat:{repeat},location:{location}}}));\
                                 return target.dispatchEvent(evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
@@ -445,8 +467,11 @@ pub async fn handle(
                             return Ok(json!({}));
                         }
 
-                        if !text.is_empty() && text != "\r" && text != "\n" {
-                            page.evaluate(&insert_text_js(text, false));
+                        if event_type == "keyDown" && !text.is_empty() && text != "\r" && text != "\n" {
+                            let allowed = page.evaluate(&printable_keypress_js(text, key, code, modifiers, repeat, location));
+                            if allowed.as_bool() == Some(true) {
+                                page.evaluate(&insert_text_js(text, false));
+                            }
                         }
 
                         if key == "Enter" {
@@ -489,7 +514,7 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,isComposing:false,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key},location:{location}}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
                             key = js_str(key),
@@ -500,6 +525,11 @@ pub async fn handle(
                     }
                     "char" => {
                         if !text.is_empty() {
+                            if text != "\r" && text != "\n" && page.evaluate(
+                                &printable_keypress_js(text, key, code, modifiers, repeat, location)
+                            ).as_bool() != Some(true) {
+                                return Ok(json!({}));
+                            }
                             page.evaluate(&insert_text_js(text, false));
                             // Pump event loop so Angular change detection picks up the input
                             page.settle(50).await;

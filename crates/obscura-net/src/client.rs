@@ -203,6 +203,9 @@ pub struct ResourceRequest {
     /// Hard limit for the decoded response body retained by this request.
     /// Callers can lower it for especially constrained resource consumers.
     pub max_response_bytes: usize,
+    /// Metadata already exposed along this redirect chain. Trust and referrer
+    /// detail must not increase when a later hop returns to the initial origin.
+    redirect_metadata: Option<(&'static str, Option<Url>)>,
 }
 
 impl ResourceRequest {
@@ -214,6 +217,7 @@ impl ResourceRequest {
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
+            redirect_metadata: None,
         }
     }
 
@@ -250,6 +254,7 @@ impl ResourceRequest {
                 | ResourceType::Xhr
                 | ResourceType::Fetch => 64 * 1024 * 1024,
             },
+            redirect_metadata: None,
         }
     }
 
@@ -271,7 +276,16 @@ impl ResourceRequest {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32 * 1024 * 1024),
+            redirect_metadata: None,
         }
+    }
+
+    /// Retain the metadata sent to the completed hop before following a redirect.
+    pub fn record_redirect_metadata(&mut self, completed_url: &Url) {
+        let site = request_fetch_site(self, completed_url);
+        let referrer = request_referrer(self, completed_url)
+            .and_then(|value| Url::parse(&value).ok());
+        self.redirect_metadata = Some((site, referrer));
     }
 
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
@@ -439,13 +453,17 @@ pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'s
     let Some(initiator) = request.initiator.as_ref() else {
         return "none";
     };
-    if initiator.origin() == target.origin() {
+    let current = if initiator.origin() == target.origin() {
         "same-origin"
+    } else if same_site(initiator, target) {
+        "same-site"
     } else {
-        // A public-suffix-aware `same-site` classification will be added with
-        // the page resource scheduler. Until then, cross-site is the safe
-        // conservative value; it never overstates ambient trust.
         "cross-site"
+    };
+    match request.redirect_metadata.as_ref().map(|(site, _)| *site) {
+        Some("cross-site") => "cross-site",
+        Some("same-site") if current == "same-origin" => "same-site",
+        _ => current,
     }
 }
 
@@ -467,10 +485,10 @@ pub(crate) fn same_site_context(
 }
 
 pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
-    let source = request
-        .referrer
-        .as_ref()
-        .or(request.initiator.as_ref())?;
+    let source = match &request.redirect_metadata {
+        Some((_, referrer)) => referrer.as_ref()?,
+        None => request.referrer.as_ref().or(request.initiator.as_ref())?,
+    };
     if !matches!(source.scheme(), "http" | "https")
         || !matches!(target.scheme(), "http" | "https")
         || (source.scheme() == "https" && target.scheme() == "http")
@@ -2080,6 +2098,40 @@ mod ssrf_tests {
             Some("https://app.example/")
         );
         assert_eq!(request_referrer(&request, &downgrade), None);
+    }
+
+    #[test]
+    fn scripted_fetch_metadata_classifies_schemeful_same_site() {
+        let source = Url::parse("https://app.example.test/login").unwrap();
+        let request = ResourceRequest::subresource(ResourceType::Fetch, &source);
+        for (url, expected) in [
+            ("https://app.example.test/authenticate", "same-origin"),
+            ("https://api.example.test/authenticate", "same-site"),
+            ("https://other.test/authenticate", "cross-site"),
+            ("http://api.example.test/authenticate", "cross-site"),
+        ] {
+            assert_eq!(request_fetch_site(&request, &Url::parse(url).unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn scripted_fetch_metadata_redirects_never_restore_trust_or_referrer_detail() {
+        let source = Url::parse("https://user:secret@app.example.test/login?q=1#fragment").unwrap();
+        let back = Url::parse("https://app.example.test/return").unwrap();
+        for (hop, expected_site, expected_referrer) in [
+            ("https://api.example.test/redirect", "same-site", Some("https://app.example.test/")),
+            ("https://other.test/redirect", "cross-site", Some("https://app.example.test/")),
+            ("http://other.test/redirect", "cross-site", None),
+        ] {
+            let mut request = ResourceRequest::subresource(ResourceType::Fetch, &source);
+            let hop = Url::parse(hop).unwrap();
+            request.record_redirect_metadata(&hop);
+            assert_eq!(request_fetch_site(&request, &back), expected_site);
+            assert_eq!(request_referrer(&request, &back).as_deref(), expected_referrer);
+            request.record_redirect_metadata(&back);
+            assert_eq!(request_fetch_site(&request, &back), expected_site);
+            assert_eq!(request_referrer(&request, &back).as_deref(), expected_referrer);
+        }
     }
 
     async fn http_fixture(

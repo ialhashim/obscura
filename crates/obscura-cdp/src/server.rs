@@ -526,9 +526,9 @@ pub async fn start_with_serve_options_limit_and_ready_file(
     bctx.allow_file_access = allow_file_access;
     let shared_ctx = Arc::new(bctx);
     // Persistence is deliberately separate from the connection template.
-    // Cookie deltas are merged here, but new connections always clone the
-    // immutable startup snapshot and can never inherit another live client's
-    // session state.
+    // Cookie deltas are merged here. Concurrent or ephemeral clients clone the
+    // immutable startup snapshot; an explicitly persistent single-client server
+    // resumes its committed profile after the prior connection releases its slot.
     let persistence_ctx = Arc::new(shared_ctx.isolated_copy("persistence".to_string(), true));
     let persistence_lock = Arc::new(std::sync::Mutex::new(()));
 
@@ -621,7 +621,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         }
         run_connection(
             stream,
-            shared_ctx.clone(),
+            connection_context_template(&shared_ctx, &persistence_ctx, max_connections).clone(),
             persistence_ctx.clone(),
             persistence_lock.clone(),
             shutdown_notify.clone(),
@@ -789,6 +789,21 @@ fn claim_connection_memory_trim(last_trim: &AtomicU64, now: u64, idle: bool) -> 
     }).is_ok()
 }
 
+fn connection_context_template<'a>(
+    startup: &'a Arc<obscura_browser::BrowserContext>,
+    persistence: &'a Arc<obscura_browser::BrowserContext>,
+    max_connections: usize,
+) -> &'a Arc<obscura_browser::BrowserContext> {
+    if max_connections == 1 && startup.storage_dir.is_some() {
+        // The previous connection merges and saves its cookies before releasing
+        // its slot. Reserving this sole slot therefore observes that completed
+        // state. run_connection still makes a separate cookie jar and client.
+        persistence
+    } else {
+        startup
+    }
+}
+
 /// Run each connection's `cdp_processor` (with its own `CdpContext` and pages)
 /// on a dedicated `current_thread` Tokio runtime and `LocalSet`. A second thread
 /// handles WebSocket I/O independently. Confining a connection's pages
@@ -913,15 +928,17 @@ fn run_connection(
             drop(local);
             drop(rt);
 
-            // Apply only this connection's cookie changes to the persistence
-            // template. Unchanged cookies cannot overwrite another connection's
-            // updates, while explicit deletes and replacements still persist.
+            // The exclusive persistent profile can copy its completed jar,
+            // retaining host-only scope as well as deletions. Concurrent clients
+            // still merge only their delta so unchanged cookies cannot overwrite
+            // another connection's updates.
             if persistence_context.storage_dir.is_some() {
                 let _guard = persistence_lock.lock().unwrap_or_else(|e| e.into_inner());
-                merge_cookie_delta(
-                    &persistence_context.cookie_jar,
+                update_cookie_persistence(
+                    &context_template,
+                    &persistence_context,
                     &initial_cookies,
-                    &persisted_context.cookie_jar.get_all_cookies(),
+                    &persisted_context.cookie_jar,
                 );
                 persistence_context.save_storage();
             }
@@ -936,6 +953,22 @@ fn run_connection(
     if let Err(e) = spawned {
         error!("connection thread spawn failed: {}", e);
         live_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn update_cookie_persistence(
+    context_template: &Arc<obscura_browser::BrowserContext>,
+    persistence_context: &Arc<obscura_browser::BrowserContext>,
+    initial_cookies: &[obscura_net::CookieInfo],
+    completed_cookies: &obscura_net::CookieJar,
+) {
+    if Arc::ptr_eq(context_template, persistence_context) {
+        // Only connection_context_template's exclusive persistent mode selects
+        // this source. CookieInfo omits host-only scope, so avoid a CDP roundtrip.
+        persistence_context.cookie_jar.copy_from(completed_cookies);
+    } else {
+        merge_cookie_delta(&persistence_context.cookie_jar, initial_cookies,
+            &completed_cookies.get_all_cookies());
     }
 }
 
@@ -3053,6 +3086,91 @@ mod tests {
         assert!(cookies.iter().any(|c| c.name == "other"));
         assert!(cookies.iter().any(|c| c.name == "added"));
         assert!(!cookies.iter().any(|c| c.name == "removed"));
+    }
+
+    #[test]
+    fn cookie_reconnect_persistent_single_client_resumes_committed_changes() {
+        use obscura_browser::BrowserContext;
+        use std::sync::Arc;
+        let mut startup = BrowserContext::new("startup".to_string());
+        // No disk operations are needed to exercise connection source selection.
+        startup.storage_dir = Some(std::path::PathBuf::from("unused-cookie-reconnect-test"));
+        startup.cookie_jar.set_cookies_from_cdp(vec![cookie("sid", "old"), cookie("removed", "old")]);
+        let startup = Arc::new(startup);
+        let persistence = Arc::new(startup.isolated_copy("persistence".to_string(), true));
+        let first = super::connection_context_template(&startup, &persistence, 1)
+            .isolated_copy("first".to_string(), true);
+        let initial = first.cookie_jar.get_all_cookies();
+        first.cookie_jar.set_cookies_from_cdp(vec![cookie("sid", "new"), cookie("added", "value")]);
+        first.cookie_jar.delete_cookies_filtered("removed", "example.com", Some("/"));
+        super::update_cookie_persistence(
+            super::connection_context_template(&startup, &persistence, 1),
+            &persistence, &initial, &first.cookie_jar);
+
+        let next = super::connection_context_template(&startup, &persistence, 1)
+            .isolated_copy("next".to_string(), true);
+        let cookies = next.cookie_jar.get_all_cookies();
+        assert!(cookies.iter().any(|c| c.name == "sid" && c.value == "new"));
+        assert!(cookies.iter().any(|c| c.name == "added"));
+        assert!(!cookies.iter().any(|c| c.name == "removed"));
+        assert!(startup.cookie_jar.get_all_cookies().iter().any(|c| c.name == "sid" && c.value == "old"));
+        assert!(!Arc::ptr_eq(&next.cookie_jar, &persistence.cookie_jar));
+        assert!(!Arc::ptr_eq(&next.http_client, &persistence.http_client));
+        next.cookie_jar.set_cookies_from_cdp(vec![cookie("later", "private")]);
+        assert!(!persistence.cookie_jar.get_all_cookies().iter().any(|c| c.name == "later"));
+    }
+
+    #[test]
+    fn cookie_reconnect_preserves_host_only_scope_and_deletions() {
+        use obscura_browser::BrowserContext;
+        use std::sync::Arc;
+        let host = url::Url::parse("https://example.com/").unwrap();
+        let child = url::Url::parse("https://sub.example.com/").unwrap();
+        let mut startup = BrowserContext::new("startup".to_string());
+        startup.storage_dir = Some(std::path::PathBuf::from("unused-cookie-reconnect-test"));
+        startup.cookie_jar.set_cookie("removed=old; Secure; Path=/", &host);
+        let startup = Arc::new(startup);
+        let persistence = Arc::new(startup.isolated_copy("persistence".to_string(), true));
+        let template = super::connection_context_template(&startup, &persistence, 1);
+        let first = template.isolated_copy("first".to_string(), true);
+        let initial = first.cookie_jar.get_all_cookies();
+        first.cookie_jar.set_cookie("host=private; Secure; Path=/", &host);
+        first.cookie_jar.set_cookie("__Host-session=private; Secure; Path=/", &host);
+        first.cookie_jar.set_cookie("domain=shared; Domain=example.com; Secure; Path=/", &host);
+        first.cookie_jar.delete_cookies_filtered("removed", "example.com", Some("/"));
+        super::update_cookie_persistence(template, &persistence, &initial, &first.cookie_jar);
+
+        let next = super::connection_context_template(&startup, &persistence, 1)
+            .isolated_copy("next".to_string(), true);
+        let host_header = next.cookie_jar.get_cookie_header_same_site(&host);
+        assert!(host_header.contains("host=private"));
+        assert!(host_header.contains("__Host-session=private"));
+        assert!(host_header.contains("domain=shared"));
+        assert!(!host_header.contains("removed="));
+        assert_eq!(next.cookie_jar.get_cookie_header_same_site(&child), "domain=shared");
+    }
+
+    #[test]
+    fn cookie_reconnect_ephemeral_and_multi_client_preserve_startup_isolation() {
+        use obscura_browser::BrowserContext;
+        use std::sync::Arc;
+        for (persistent, max_connections) in [(false, 1), (false, 2), (true, 2)] {
+            let mut startup = BrowserContext::new("startup".to_string());
+            if persistent {
+                startup.storage_dir = Some(std::path::PathBuf::from("unused-cookie-reconnect-test"));
+            }
+            startup.cookie_jar.set_cookies_from_cdp(vec![cookie("sid", "startup")]);
+            let startup = Arc::new(startup);
+            let persistence = Arc::new(startup.isolated_copy("persistence".to_string(), true));
+            persistence.cookie_jar.set_cookies_from_cdp(vec![cookie("sid", "other-client"), cookie("private", "value")]);
+            let next = super::connection_context_template(&startup, &persistence, max_connections)
+                .isolated_copy("next".to_string(), true);
+            let cookies = next.cookie_jar.get_all_cookies();
+            assert_eq!(cookies.len(), 1);
+            assert_eq!(cookies[0].name, "sid");
+            assert_eq!(cookies[0].value, "startup");
+            assert!(!Arc::ptr_eq(&next.cookie_jar, &startup.cookie_jar));
+        }
     }
 
     #[cfg(feature = "render")]

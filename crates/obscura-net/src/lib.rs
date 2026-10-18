@@ -6,6 +6,8 @@ pub mod robots;
 pub mod blocklist;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
+#[cfg(feature = "stealth")]
+mod sab_cookie_diagnostic;
 
 pub use client::{
     env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,

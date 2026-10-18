@@ -64,6 +64,10 @@ async fn textarea_idl_matches_browser_semantics() {
                 ctor: t.constructor.name,
                 is_textarea: t instanceof HTMLTextAreaElement,
                 is_element: t instanceof Element,
+                own_value_getter: typeof Object.getOwnPropertyDescriptor(
+                    HTMLTextAreaElement.prototype, 'value').get,
+                own_value_setter: typeof Object.getOwnPropertyDescriptor(
+                    HTMLTextAreaElement.prototype, 'value').set,
                 rows_reflect: (t.rows = 5, t.getAttribute('rows')),
                 rows_after_set: t.rows,
                 rows_invalid: (t.setAttribute('rows', '0'), t.rows),
@@ -77,6 +81,8 @@ async fn textarea_idl_matches_browser_semantics() {
     assert_eq!(probes["ctor"], "HTMLTextAreaElement");
     assert_eq!(probes["is_textarea"], true);
     assert_eq!(probes["is_element"], true);
+    assert_eq!(probes["own_value_getter"], "function");
+    assert_eq!(probes["own_value_setter"], "function");
     assert_eq!(probes["rows_reflect"], "5");
     assert_eq!(probes["rows_after_set"], 5);
     // rows/cols are limited to positive numbers; anything else reads back

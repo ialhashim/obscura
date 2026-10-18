@@ -59,9 +59,9 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
 
-// The wreq emulation (Profile::Chrome145, Platform::Linux) sends this exact
+// The wreq emulation (Profile::Chrome153, Platform::Linux) sends this exact
 // UA and sec-ch-ua-platform "Linux" on the wire. navigator has to report the
 // same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
 // site cross-checks the mismatch as a bot signal.
@@ -191,6 +191,7 @@ pub struct StealthHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    cookie_diagnostic: Option<Arc<crate::sab_cookie_diagnostic::SabCookieDiagnostic>>,
 }
 
 /// Scripted fetch exposes these headers before consuming the bounded body.
@@ -199,6 +200,41 @@ pub struct StealthResponseHeaders {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub body: futures_util::future::BoxFuture<'static, Result<Vec<u8>, ObscuraNetError>>,
+}
+
+/// Scripted requests need resource metadata, not the emulation's navigation
+/// defaults. Explicit Accept is application-owned; Sec-Fetch and Referer are not.
+#[cfg(feature = "stealth")]
+fn scripted_request_headers(
+    extra_headers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+    request: &ResourceRequest,
+    target: &Url,
+) -> Result<wreq::header::HeaderMap, ObscuraNetError> {
+    let mut result = wreq::header::HeaderMap::new();
+    for source in [extra_headers, headers] {
+        for (name, value) in source {
+            let lower = name.to_ascii_lowercase();
+            if lower.starts_with("sec-fetch-") || lower == "upgrade-insecure-requests" || lower == "referer" {
+                continue;
+            }
+            let name = wreq::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ObscuraNetError::Network("invalid scripted request header name".into()))?;
+            let value = wreq::header::HeaderValue::from_str(value)
+                .map_err(|_| ObscuraNetError::Network("invalid scripted request header value".into()))?;
+            result.insert(name, value);
+        }
+    }
+    result.entry("accept").or_insert(wreq::header::HeaderValue::from_static(request.accept()));
+    result.insert("sec-fetch-site", wreq::header::HeaderValue::from_static(request_fetch_site(request, target)));
+    result.insert("sec-fetch-mode", wreq::header::HeaderValue::from_static(request.mode.header_value()));
+    result.insert("sec-fetch-dest", wreq::header::HeaderValue::from_static(request.destination()));
+    if let Some(referrer) = request_referrer(request, target) {
+        if let Ok(value) = wreq::header::HeaderValue::from_str(&referrer) {
+            result.insert("referer", value);
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(feature = "stealth")]
@@ -213,7 +249,7 @@ impl StealthHttpClient {
         allow_private_network: bool,
     ) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
+            .profile(wreq_util::Profile::Chrome153)
             .platform(wreq_util::Platform::Linux)
             .build();
 
@@ -286,6 +322,7 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            cookie_diagnostic: crate::sab_cookie_diagnostic::SabCookieDiagnostic::from_env(),
         }
     }
 
@@ -524,6 +561,38 @@ impl StealthHttpClient {
         store_cookies: bool,
         max_body_bytes: usize,
     ) -> Result<StealthResponseHeaders, ObscuraNetError> {
+        self.send_single_headers_with_profile(
+            method, url, headers, body, cookie_context, store_cookies, max_body_bytes, None,
+        ).await
+    }
+
+    pub async fn send_profiled_single_headers_with_context(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+        max_body_bytes: usize,
+        request: &ResourceRequest,
+    ) -> Result<StealthResponseHeaders, ObscuraNetError> {
+        self.send_single_headers_with_profile(
+            method, url, headers, body, cookie_context, store_cookies, max_body_bytes, Some(request),
+        ).await
+    }
+
+    async fn send_single_headers_with_profile(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+        max_body_bytes: usize,
+        request: Option<&ResourceRequest>,
+    ) -> Result<StealthResponseHeaders, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
             return Ok(StealthResponseHeaders {
@@ -544,16 +613,25 @@ impl StealthHttpClient {
                 req = req.header("cookie", &cookie_header);
             }
         }
-        for (k, v) in self.extra_headers.read().await.iter() {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        for (k, v) in headers.iter() {
-            req = req.header(k.as_str(), v.as_str());
+        if let Some(request) = request {
+            let extra_headers = self.extra_headers.read().await;
+            // .header() appends in wreq; .headers() replaces existing values
+            // so browser-owned fields never coexist with caller metadata.
+            req = req.headers(scripted_request_headers(&extra_headers, headers, request, url)?);
+        } else {
+            for (k, v) in self.extra_headers.read().await.iter() {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            for (k, v) in headers.iter() {
+                req = req.header(k.as_str(), v.as_str());
+            }
         }
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }
 
+        let cookie_diagnostic_call = self.cookie_diagnostic.as_ref().and_then(|diagnostic|
+            diagnostic.request(method, url, &req, &self.cookie_jar, cookie_context));
         let in_flight = InFlightGuard::new(&self.in_flight);
         let resp = req.send().await.map_err(|e| {
             ObscuraNetError::Network(format!("{}: {}", url, error_chain(&e)))
@@ -566,6 +644,9 @@ impl StealthHttpClient {
                     self.cookie_jar.set_cookie(s, url);
                 }
             }
+        }
+        if let (Some(diagnostic), Some(call)) = (&self.cookie_diagnostic, cookie_diagnostic_call) {
+            diagnostic.response(call, url, resp.headers(), &self.cookie_jar, cookie_context, store_cookies);
         }
         let response_headers: HashMap<String, String> = resp
             .headers()
@@ -606,12 +687,66 @@ mod tests {
     use url::Url;
 
     use super::{
-        StealthHttpClient, is_tracker_blocked, send_get_with_connection_reset_retry,
+        StealthHttpClient, is_tracker_blocked, send_get_with_connection_reset_retry, scripted_request_headers,
         tracker_blocking_enabled,
     };
-    use crate::client::{ObscuraNetError, SsrfGuardResolver};
+    use crate::client::{ObscuraNetError, ResourceRequest, ResourceType, SsrfGuardResolver};
     use crate::cookies::CookieJar;
     use wreq::dns::{Name, Resolve};
+
+    #[test]
+    fn scripted_fetch_metadata_preserves_accept_and_replaces_navigation_fields() {
+        let source = Url::parse("https://user:secret@app.example.test/login?q=1#fragment").unwrap();
+        let target = Url::parse("https://app.example.test/authenticate").unwrap();
+        let profile = ResourceRequest::subresource(ResourceType::Fetch, &source);
+        let extra = std::collections::HashMap::from([
+            ("Accept".to_string(), "text/html".to_string()),
+            ("sec-fetch-user".to_string(), "?1".to_string()),
+            ("upgrade-insecure-requests".to_string(), "1".to_string()),
+        ]);
+        let caller = std::collections::HashMap::from([
+            ("accept".to_string(), "application/json".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Origin".to_string(), "https://app.example.test".to_string()),
+            ("Sec-Fetch-Mode".to_string(), "navigate".to_string()),
+            ("Sec-Fetch-Dest".to_string(), "document".to_string()),
+            ("Sec-Fetch-Site".to_string(), "none".to_string()),
+            ("Sec-Fetch-Private".to_string(), "forged".to_string()),
+            ("Referer".to_string(), "https://unrelated.example/".to_string()),
+        ]);
+        let headers = scripted_request_headers(&extra, &caller, &profile, &target).unwrap();
+        assert_eq!(headers.get("accept").unwrap(), "application/json");
+        assert_eq!(headers.get_all("accept").iter().count(), 1);
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(headers.get("origin").unwrap(), "https://app.example.test");
+        assert_eq!(headers.get("sec-fetch-mode").unwrap(), "cors");
+        assert_eq!(headers.get("sec-fetch-dest").unwrap(), "empty");
+        assert_eq!(headers.get("sec-fetch-site").unwrap(), "same-origin");
+        assert_eq!(headers.get("referer").unwrap(), "https://app.example.test/login?q=1");
+        for absent in ["sec-fetch-user", "sec-fetch-private", "upgrade-insecure-requests"] {
+            assert!(!headers.contains_key(absent));
+        }
+    }
+
+    #[test]
+    fn scripted_fetch_metadata_defaults_and_cross_origin_referrers() {
+        let source = Url::parse("https://user:secret@app.example.test/login?q=1#fragment").unwrap();
+        let profile = ResourceRequest::subresource(ResourceType::Xhr, &source);
+        let empty = std::collections::HashMap::new();
+        for (url, site, referrer) in [
+            ("https://api.example.test/authenticate", "same-site", Some("https://app.example.test/")),
+            ("https://other.test/authenticate", "cross-site", Some("https://app.example.test/")),
+            ("http://api.example.test/authenticate", "cross-site", None),
+        ] {
+            let target = Url::parse(url).unwrap();
+            let headers = scripted_request_headers(&empty, &empty, &profile, &target).unwrap();
+            assert_eq!(headers.get("accept").unwrap(), "*/*");
+            assert_eq!(headers.get("sec-fetch-site").unwrap(), site);
+            assert_eq!(headers.get("sec-fetch-mode").unwrap(), "cors");
+            assert_eq!(headers.get("sec-fetch-dest").unwrap(), "empty");
+            assert_eq!(headers.get("referer").map(|value| value.to_str().unwrap()), referrer);
+        }
+    }
 
     // Mirrors client::ssrf_tests::resolver_blocks_hostname_that_resolves_to_loopback.
     // Both transports must agree: a host-string check alone cannot see that a
@@ -823,6 +958,7 @@ mod tests {
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            cookie_diagnostic: None,
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client

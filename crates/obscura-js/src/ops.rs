@@ -18,7 +18,7 @@ use obscura_net::{
     CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
     SameSiteContext, same_site,
 };
-#[cfg(feature = "render")]
+#[cfg(any(feature = "render", feature = "stealth"))]
 use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 use tokio::sync::Mutex;
 
@@ -4126,6 +4126,38 @@ async fn fetch_url_inner(
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
 
+    // Temporary opt-in diagnostics at the native request boundary. Never emit
+    // callback values, authentication tokens, headers, cookies, or URL queries.
+    if std::env::var("HLIFE_SAB_AUTH_SHAPE_DIAGNOSTIC").as_deref() == Ok("1")
+        && url::Url::parse(&url).is_ok_and(|parsed|
+            parsed.scheme() == "https"
+                && parsed.host_str() == Some("www.security.online-banking.sabbnet.com")
+                && parsed.path() == "/am/json/realms/root/realms/external/authenticate")
+    {
+        let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        let callbacks = parsed.as_ref().and_then(|value| value.get("callbacks"))
+            .and_then(serde_json::Value::as_array);
+        let populated = |callback: &serde_json::Value| callback.get("input")
+            .and_then(serde_json::Value::as_array).is_some_and(|inputs| inputs.iter().any(|input|
+                input.get("value").and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty())));
+        let username_present = callbacks.is_some_and(|items| items.iter().any(|callback|
+            callback.get("type").and_then(serde_json::Value::as_str) == Some("NameCallback")
+                && populated(callback)));
+        let verification_present = callbacks.is_some_and(|items| items.iter().any(|callback|
+            callback.get("type").and_then(serde_json::Value::as_str) == Some("HiddenValueCallback")
+                && callback.get("output").and_then(serde_json::Value::as_array).is_some_and(|outputs|
+                    outputs.iter().any(|output| output.get("value").and_then(serde_json::Value::as_str)
+                        == Some("recaptcha_token"))) && populated(callback)));
+        let auth_id_present = parsed.as_ref().and_then(|value| value.get("authId"))
+            .and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty());
+        tracing::info!(target: "hlife_sab_auth_shape",
+            body_bytes = body.len(), json_valid = parsed.is_some(),
+            callback_count = callbacks.map_or(0, |items| items.len()),
+            auth_id_present, username_present, verification_present,
+            credentials_include = credentials == FetchCredentials::Include,
+            "SAB native authentication request shape");
+    }
+
     let client = match &http_client {
         Some(client) => client.request_client().await,
         None => {
@@ -4601,6 +4633,35 @@ async fn stealth_fetch_all(
     network_guard: FetchNetworkGuard,
     resource_type: ResourceType,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let initiator = url::Url::parse(&page_origin).ok();
+    let mut request_profile = initiator.as_ref()
+        .map(|origin| ResourceRequest::subresource(resource_type, origin))
+        .unwrap_or_else(ResourceRequest::navigation);
+    request_profile.resource_type = resource_type;
+    request_profile.mode = match mode.as_str() {
+        "cors" => RequestMode::Cors,
+        "same-origin" => RequestMode::SameOrigin,
+        "no-cors" => RequestMode::NoCors,
+        _ if resource_type == ResourceType::Document => RequestMode::Navigate,
+        _ => RequestMode::NoCors,
+    };
+    request_profile.credentials = match credentials {
+        FetchCredentials::Omit => RequestCredentials::Omit,
+        FetchCredentials::Include => RequestCredentials::Include,
+        FetchCredentials::SameOrigin => RequestCredentials::SameOrigin,
+    };
+    // Keep the document path for same-origin Referer; the shared helper strips
+    // credentials/fragments and reduces cross-origin referrers to their origin.
+    // This runtime supports the default strict-origin-when-cross-origin policy;
+    // explicit fetch/referrer-policy overrides are not yet passed through JS.
+    request_profile.referrer = {
+        let st = state.borrow();
+        let gs = st.borrow::<SharedState>().clone();
+        let document = gs.borrow();
+        url::Url::parse(&document.url).ok()
+            .filter(|url| url.origin().ascii_serialization() == page_origin)
+            .or_else(|| initiator.clone())
+    };
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
@@ -4647,7 +4708,7 @@ async fn stealth_fetch_all(
             }
         });
         let r = stealth
-            .send_single_headers_with_context(
+            .send_profiled_single_headers_with_context(
                 &current_method,
                 &parsed_current,
                 &req_headers,
@@ -4655,6 +4716,7 @@ async fn stealth_fetch_all(
                 cookie_context,
                 credentials_allowed,
                 fetch_max_body_bytes().min(64 * 1024 * 1024),
+                &request_profile,
             )
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
@@ -4722,6 +4784,7 @@ async fn stealth_fetch_all(
         // Do not forward credentials to a different origin (#967).
         let crosses_origin = parsed_current.origin() != next_url.origin();
         sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
+        request_profile.record_redirect_metadata(&parsed_current);
         redirected_from.push(parsed_current);
         current_url = next_url.to_string();
     };
@@ -6921,6 +6984,337 @@ fn crypto_err(msg: impl std::fmt::Display) -> deno_error::JsErrorBox {
     deno_error::JsErrorBox::generic(msg.to_string())
 }
 
+// RSA is available when the existing BoringSSL provider is compiled in. JS and
+// IndexedDB receive authenticated encrypted capsules, never raw private keys.
+// The wrapping key is process-private and is not persisted. Capsules survive
+// same-process structured clones, but are intentionally not restart-portable.
+// Durable profile storage needs a separate protected-key lifecycle before it
+// can persist these capsules across browser restarts.
+#[cfg(feature = "stealth")]
+mod rsa_crypto {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use btls::bn::BigNum;
+    use btls::hash::MessageDigest;
+    use btls::pkey::{HasPublic, Id, PKey, PKeyRef};
+    use btls::rsa::{Padding, Rsa};
+    use btls::sign::{Signer, Verifier};
+    use deno_core::{JsBuffer, op2};
+    use deno_error::JsErrorBox;
+    use serde::Serialize;
+    use std::sync::OnceLock;
+
+    use super::crypto_err;
+
+    const MIN_BITS: u32 = 1024;
+    const MAX_BITS: u32 = 8192;
+    const MAX_DER_BYTES: usize = 16 * 1024;
+    const CAPSULE_VERSION: u8 = 1;
+    const NONCE_BYTES: usize = 12;
+    const TAG_BYTES: usize = 16;
+    const METADATA_BYTES: usize = 3;
+    const CAPSULE_AAD: &[u8] = b"obscura.crypto.rsassa-pkcs1-v1_5.private-key.v1";
+    static CAPSULE_KEY: OnceLock<Result<[u8; 32], getrandom::Error>> = OnceLock::new();
+    // A dropped page must not release its slot while native generation is
+    // still running. The blocking task owns the permit until it finishes.
+    static GENERATION_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(super) struct GeneratedKeyPair {
+        private_key: Vec<u8>,
+        public_key: Vec<u8>,
+        modulus: Vec<u8>,
+        exponent: Vec<u8>,
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct PublicComponents {
+        modulus: Vec<u8>,
+        exponent: Vec<u8>,
+    }
+
+    fn validate_bits(bits: u32) -> Result<(), JsErrorBox> {
+        if !(MIN_BITS..=MAX_BITS).contains(&bits) {
+            return Err(JsErrorBox::range_error("RSA modulus length must be 1024 through 8192 bits"));
+        }
+        Ok(())
+    }
+
+    fn parse_exponent(bytes: &[u8]) -> Result<u32, JsErrorBox> {
+        let start = bytes.iter().position(|byte| *byte != 0).unwrap_or(bytes.len());
+        let bytes = &bytes[start..];
+        if bytes.is_empty() || bytes.len() > 4 {
+            return Err(JsErrorBox::range_error("RSA public exponent must fit an unsigned 32-bit integer"));
+        }
+        let value = bytes.iter().fold(0u32, |value, byte| (value << 8) | u32::from(*byte));
+        if value < 3 || value % 2 == 0 {
+            return Err(JsErrorBox::range_error("RSA public exponent must be odd and at least 3"));
+        }
+        Ok(value)
+    }
+
+    fn hash_spec(hash: &str) -> Result<(u8, MessageDigest), JsErrorBox> {
+        match hash {
+            "SHA-1" => Ok((1, MessageDigest::sha1())),
+            "SHA-256" => Ok((2, MessageDigest::sha256())),
+            "SHA-384" => Ok((3, MessageDigest::sha384())),
+            "SHA-512" => Ok((4, MessageDigest::sha512())),
+            _ => Err(JsErrorBox::type_error("Unsupported RSA hash")),
+        }
+    }
+
+    fn capsule_cipher() -> Result<Aes256Gcm, JsErrorBox> {
+        let key = CAPSULE_KEY.get_or_init(|| {
+            let mut key = [0u8; 32];
+            getrandom::getrandom(&mut key).map(|_| key)
+        }).as_ref().map_err(|_| crypto_err("RSA key protection is unavailable"))?;
+        Aes256Gcm::new_from_slice(key).map_err(|_| crypto_err("RSA key protection is unavailable"))
+    }
+
+    fn seal_private(der: &[u8], hash_id: u8, extractable: bool) -> Result<Vec<u8>, JsErrorBox> {
+        validate_der(der)?;
+        if !(1..=4).contains(&hash_id) {
+            return Err(JsErrorBox::type_error("Unsupported RSA hash"));
+        }
+        let mut nonce = [0u8; NONCE_BYTES];
+        getrandom::getrandom(&mut nonce).map_err(|_| crypto_err("RSA key protection is unavailable"))?;
+        // Hash, extractability, and sign permission are authenticated inside
+        // the capsule. Mutable CryptoKey metadata cannot grant new authority.
+        let mut plaintext = Vec::with_capacity(METADATA_BYTES + der.len());
+        plaintext.extend_from_slice(&[hash_id, u8::from(extractable), 1]);
+        plaintext.extend_from_slice(der);
+        let ciphertext = capsule_cipher()?.encrypt(
+            Nonce::from_slice(&nonce),
+            Payload { msg: &plaintext, aad: CAPSULE_AAD },
+        ).map_err(|_| crypto_err("RSA key protection failed"))?;
+        let mut capsule = Vec::with_capacity(1 + NONCE_BYTES + ciphertext.len());
+        capsule.push(CAPSULE_VERSION);
+        capsule.extend_from_slice(&nonce);
+        capsule.extend_from_slice(&ciphertext);
+        Ok(capsule)
+    }
+
+    struct PrivateMaterial {
+        der: Vec<u8>,
+        hash_id: u8,
+        extractable: bool,
+        sign_allowed: bool,
+    }
+
+    fn open_private(capsule: &[u8]) -> Result<PrivateMaterial, JsErrorBox> {
+        let overhead = 1 + NONCE_BYTES + TAG_BYTES + METADATA_BYTES;
+        if capsule.len() <= overhead || capsule.len() > overhead + MAX_DER_BYTES
+            || capsule[0] != CAPSULE_VERSION {
+            return Err(crypto_err("Invalid or unavailable RSA private key"));
+        }
+        let nonce = &capsule[1..1 + NONCE_BYTES];
+        let plaintext = capsule_cipher()?.decrypt(
+            Nonce::from_slice(nonce),
+            Payload { msg: &capsule[1 + NONCE_BYTES..], aad: CAPSULE_AAD },
+        ).map_err(|_| crypto_err("Invalid or unavailable RSA private key"))?;
+        if plaintext.len() <= METADATA_BYTES || !(1..=4).contains(&plaintext[0])
+            || plaintext[1] > 1 || plaintext[2] > 1 {
+            return Err(crypto_err("Invalid or unavailable RSA private key"));
+        }
+        Ok(PrivateMaterial {
+            der: plaintext[METADATA_BYTES..].to_vec(),
+            hash_id: plaintext[0],
+            extractable: plaintext[1] == 1,
+            sign_allowed: plaintext[2] == 1,
+        })
+    }
+
+    fn validate_der(der: &[u8]) -> Result<(), JsErrorBox> {
+        if der.is_empty() || der.len() > MAX_DER_BYTES {
+            return Err(JsErrorBox::range_error("Invalid RSA key encoding length"));
+        }
+        Ok(())
+    }
+
+    fn validate_key<T: HasPublic>(key: &PKeyRef<T>) -> Result<(), JsErrorBox> {
+        if key.id() != Id::RSA {
+            return Err(JsErrorBox::type_error("Key is not an RSA key"));
+        }
+        validate_bits(key.bits())
+    }
+
+    fn generate(bits: u32, exponent: u32, hash: &str, extractable: bool) -> Result<GeneratedKeyPair, JsErrorBox> {
+        validate_bits(bits)?;
+        parse_exponent(&exponent.to_be_bytes())?;
+        let (hash_id, _) = hash_spec(hash)?;
+        let exponent = BigNum::from_u32(exponent).map_err(crypto_err)?;
+        let rsa = Rsa::generate_with_e(bits, &exponent).map_err(crypto_err)?;
+        let modulus = rsa.n().to_vec();
+        let exponent = rsa.e().to_vec();
+        let key = PKey::from_rsa(rsa).map_err(crypto_err)?;
+        Ok(GeneratedKeyPair {
+            private_key: seal_private(&key.private_key_to_der_pkcs8().map_err(crypto_err)?, hash_id, extractable)?,
+            public_key: key.public_key_to_der().map_err(crypto_err)?,
+            modulus,
+            exponent,
+        })
+    }
+
+    #[op2]
+    #[serde]
+    pub(super) async fn op_subtle_rsa_generate(
+        modulus_length: u32,
+        #[buffer] exponent: JsBuffer,
+        #[string] hash: String,
+        extractable: bool,
+    ) -> Result<GeneratedKeyPair, JsErrorBox> {
+        validate_bits(modulus_length)?;
+        let exponent = parse_exponent(&exponent)?;
+        hash_spec(&hash)?;
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| crypto_err("RSA generation requires an asynchronous runtime"))?;
+        let permit = GENERATION_SLOTS.acquire().await
+            .map_err(|_| crypto_err("RSA generation is unavailable"))?;
+        runtime.spawn_blocking(move || {
+            let _permit = permit;
+            generate(modulus_length, exponent, &hash, extractable)
+        }).await.map_err(|_| crypto_err("RSA generation did not complete"))?
+    }
+
+    fn sign(hash: &str, capsule: &[u8], data: &[u8]) -> Result<Vec<u8>, JsErrorBox> {
+        let (hash_id, digest) = hash_spec(hash)?;
+        let material = open_private(capsule)?;
+        if material.hash_id != hash_id || !material.sign_allowed {
+            return Err(JsErrorBox::type_error("RSA key does not permit this signing operation"));
+        }
+        let key = PKey::private_key_from_pkcs8(&material.der).map_err(crypto_err)?;
+        validate_key(&key)?;
+        let mut signer = Signer::new(digest, &key).map_err(crypto_err)?;
+        signer.set_rsa_padding(Padding::PKCS1).map_err(crypto_err)?;
+        signer.update(data).map_err(crypto_err)?;
+        signer.sign_to_vec().map_err(crypto_err)
+    }
+
+    #[op2]
+    #[buffer]
+    pub(super) fn op_subtle_rsa_sign(
+        #[string] hash: &str,
+        #[buffer] capsule: &[u8],
+        #[buffer] data: &[u8],
+    ) -> Result<Vec<u8>, JsErrorBox> {
+        sign(hash, capsule, data)
+    }
+
+    fn export_private(capsule: &[u8]) -> Result<Vec<u8>, JsErrorBox> {
+        let material = open_private(capsule)?;
+        if !material.extractable {
+            return Err(JsErrorBox::type_error("RSA private key is not extractable"));
+        }
+        Ok(material.der)
+    }
+
+    #[op2]
+    #[buffer]
+    pub(super) fn op_subtle_rsa_export_private(
+        #[buffer] capsule: &[u8],
+    ) -> Result<Vec<u8>, JsErrorBox> {
+        export_private(capsule)
+    }
+
+    fn verify(hash: &str, der: &[u8], signature: &[u8], data: &[u8]) -> Result<bool, JsErrorBox> {
+        let (_, digest) = hash_spec(hash)?;
+        validate_der(der)?;
+        let key = PKey::public_key_from_der(der).map_err(crypto_err)?;
+        validate_key(&key)?;
+        // Incorrect signature length is a verification failure, not a malformed
+        // key or native-provider failure.
+        if signature.len() != key.size() {
+            return Ok(false);
+        }
+        let mut verifier = Verifier::new(digest, &key).map_err(crypto_err)?;
+        verifier.set_rsa_padding(Padding::PKCS1).map_err(crypto_err)?;
+        verifier.update(data).map_err(crypto_err)?;
+        verifier.verify(signature).map_err(crypto_err)
+    }
+
+    #[op2(fast)]
+    pub(super) fn op_subtle_rsa_verify(
+        #[string] hash: &str,
+        #[buffer] public_der: &[u8],
+        #[buffer] signature: &[u8],
+        #[buffer] data: &[u8],
+    ) -> Result<bool, JsErrorBox> {
+        verify(hash, public_der, signature, data)
+    }
+
+    fn public_components(der: &[u8]) -> Result<PublicComponents, JsErrorBox> {
+        validate_der(der)?;
+        let key = PKey::public_key_from_der(der).map_err(crypto_err)?;
+        validate_key(&key)?;
+        let rsa = key.rsa().map_err(crypto_err)?;
+        Ok(PublicComponents { modulus: rsa.n().to_vec(), exponent: rsa.e().to_vec() })
+    }
+
+    #[op2]
+    #[serde]
+    pub(super) fn op_subtle_rsa_public_components(
+        #[buffer] public_der: &[u8],
+    ) -> Result<PublicComponents, JsErrorBox> {
+        public_components(public_der)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn generation_parameters_are_bounded() {
+            for bits in [0, 512, 8193, u32::MAX] {
+                assert!(validate_bits(bits).is_err());
+            }
+            for bytes in [&[][..], &[0], &[1], &[2], &[1, 0, 0], &[1, 0, 0, 0, 1]] {
+                assert!(parse_exponent(bytes).is_err());
+            }
+            assert_eq!(parse_exponent(&[0, 0, 1, 0, 1]).unwrap(), 65537);
+            assert_eq!(parse_exponent(&[3]).unwrap(), 3);
+        }
+
+        #[test]
+        fn native_rsa_roundtrips_der_and_rejects_changed_signatures() {
+            for hash in ["SHA-1", "SHA-256", "SHA-384", "SHA-512"] {
+                let pair = generate(1024, 65537, hash, false).unwrap();
+                let public = public_components(&pair.public_key).unwrap();
+                assert_eq!(public.modulus, pair.modulus);
+                assert_eq!(public.exponent, [1, 0, 1]);
+                let signature = sign(hash, &pair.private_key, b"offline RSA fixture").unwrap();
+                assert!(verify(hash, &pair.public_key, &signature, b"offline RSA fixture").unwrap());
+                assert!(!verify(hash, &pair.public_key, &signature, b"changed").unwrap());
+                assert!(!verify(hash, &pair.public_key, &signature[..1], b"offline RSA fixture").unwrap());
+                assert!(sign(hash, &pair.public_key, b"data").is_err());
+                assert!(verify(hash, &pair.private_key, &[], b"data").is_err());
+                assert!(export_private(&pair.private_key).is_err());
+            }
+            assert!(public_components(&[]).is_err());
+            assert!(public_components(&[0; MAX_DER_BYTES + 1]).is_err());
+        }
+
+        #[test]
+        fn private_capsules_bind_permissions_hash_and_authentication() {
+            let pair = generate(1024, 65537, "SHA-256", true).unwrap();
+            let der = export_private(&pair.private_key).unwrap();
+            assert!(PKey::private_key_from_pkcs8(&der).is_ok());
+            assert!(PKey::private_key_from_pkcs8(&pair.private_key).is_err());
+            assert!(sign("SHA-256", &der, b"data").is_err());
+            assert!(sign("SHA-384", &pair.private_key, b"data").is_err());
+            assert!(sign("invalid", &pair.private_key, b"data").is_err());
+            let non_extractable = seal_private(&der, 2, false).unwrap();
+            assert!(export_private(&non_extractable).is_err());
+            for index in [0, 1, 1 + NONCE_BYTES, pair.private_key.len() - 1] {
+                let mut altered = pair.private_key.clone();
+                altered[index] ^= 1;
+                assert!(sign("SHA-256", &altered, b"data").is_err());
+                assert!(export_private(&altered).is_err());
+            }
+        }
+    }
+}
+
 /// HMAC sign. `hash` is a normalized SubtleCrypto hash name; any key length is
 /// accepted (HMAC pads or hashes the key per RFC 2104). Returns the MAC bytes;
 /// the shim does the constant-time-insensitive compare for `verify`.
@@ -7714,6 +8108,14 @@ pub fn build_extension() -> Extension {
     ];
     ops.extend(crate::message::ops());
     ops.extend(crate::message_port::ops());
+    #[cfg(feature = "stealth")]
+    {
+        ops.push(rsa_crypto::op_subtle_rsa_generate());
+        ops.push(rsa_crypto::op_subtle_rsa_sign());
+        ops.push(rsa_crypto::op_subtle_rsa_export_private());
+        ops.push(rsa_crypto::op_subtle_rsa_verify());
+        ops.push(rsa_crypto::op_subtle_rsa_public_components());
+    }
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
