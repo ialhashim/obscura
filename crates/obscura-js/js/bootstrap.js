@@ -14086,6 +14086,13 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   }
   set cols(v) { this.setAttribute('cols', String(v)); }
 };
+// Frameworks commonly patch textarea values through the descriptor owned by
+// HTMLTextAreaElement.prototype. Chromium exposes that descriptor directly;
+// inheriting only Element.prototype.value makes
+// Object.getOwnPropertyDescriptor(..., 'value') return undefined and crashes
+// SDK input components before application initialization.
+Object.defineProperty(HTMLTextAreaElement.prototype, 'value',
+  Object.getOwnPropertyDescriptor(Element.prototype, 'value'));
 globalThis.HTMLLabelElement = Element;
 for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
   Object.defineProperty(proto, 'readOnly', { enumerable: true });
