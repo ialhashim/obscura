@@ -1202,17 +1202,22 @@ pub(crate) fn emit_runtime_network_events(
     for network_event in network_events {
         let request_id = &network_event.request_id;
         if !network_event.intercepted {
+            let mut request = json!({
+                "url": network_event.url,
+                "method": network_event.method,
+                "headers": network_event.headers,
+            });
+            if let Some(post_data) = network_event.post_data.as_ref() {
+                request["hasPostData"] = json!(true);
+                request["postData"] = json!(post_data);
+            }
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
                 params: json!({
                     "requestId": request_id,
                     "loaderId": loader_id,
                     "documentURL": page_url,
-                    "request": {
-                        "url": network_event.url,
-                        "method": network_event.method,
-                        "headers": network_event.headers,
-                    },
+                    "request": request,
                     "timestamp": network_event.timestamp,
                     "wallTime": network_event.timestamp,
                     "initiator": {"type": "script"},
@@ -2052,6 +2057,7 @@ mod tests {
             ("script-1", "Script", "https://example.test/app.js", 404)]
             .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
                 request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
+                post_data: None,
                 resource_type: kind.into(), status, headers: Default::default(),
                 response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
                 error_text: None,
@@ -2395,10 +2401,14 @@ mod tests {
             request_id: "fetch-7".into(),
             intercepted: false,
             url: "https://example.test/data.json".into(),
-            method: "GET".into(),
+            method: "POST".into(),
+            post_data: Some(r#"{"probe":true}"#.into()),
             resource_type: "Fetch".into(),
             status: 200,
-            headers: std::collections::HashMap::new(),
+            headers: std::collections::HashMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("x-requested-with".into(), "forgerock-sdk".into()),
+            ]),
             response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
                 "content-type".into(),
                 "application/json".into(),
@@ -2420,6 +2430,10 @@ mod tests {
         assert_eq!(ctx.pending_events.len(), 3);
         assert_eq!(ctx.pending_events[0].method, "Network.requestWillBeSent");
         assert_eq!(ctx.pending_events[0].params["loaderId"], "loader-current");
+        assert_eq!(ctx.pending_events[0].params["request"]["hasPostData"], true);
+        assert_eq!(ctx.pending_events[0].params["request"]["postData"], r#"{"probe":true}"#);
+        assert_eq!(ctx.pending_events[0].params["request"]["headers"]["content-type"], "application/json");
+        assert_eq!(ctx.pending_events[0].params["request"]["headers"]["x-requested-with"], "forgerock-sdk");
         assert_eq!(ctx.pending_events[1].method, "Network.responseReceived");
         assert_eq!(ctx.pending_events[1].params["loaderId"], "loader-current");
         assert_eq!(ctx.pending_events[2].method, "Network.loadingFinished");
@@ -2493,6 +2507,7 @@ mod tests {
             intercepted: false,
             url: url.into(),
             method: "GET".into(),
+            post_data: None,
             resource_type: kind.into(),
             status: 200,
             headers: std::collections::HashMap::new(),
@@ -2554,6 +2569,7 @@ mod tests {
             intercepted: false,
             url: page_url.into(),
             method: "GET".into(),
+            post_data: None,
             resource_type: "Document".into(),
             status: 200,
             headers: std::collections::HashMap::new(),

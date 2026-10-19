@@ -22567,6 +22567,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].method, expected_method);
         assert!(events[0].url.ends_with("/final"));
+        assert_eq!(events[0].post_data.as_deref(),
+            (expected_method == "POST").then_some("payload"));
+        assert!(rt.take_js_network_events().is_empty(),
+            "request metadata must leave the runtime when the event queue is drained");
         let wire_requests = wire_requests.lock().unwrap();
         assert!(wire_requests[0].starts_with("POST /start "));
         assert!(wire_requests[1].starts_with(&format!("{expected_method} /final ")));
@@ -22580,6 +22584,51 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_307_response_preserves_the_post_method() {
         assert_post_redirect_method(307, "POST").await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_network_event_preserves_bounded_request_metadata() {
+        let (mut rt, wire_requests) = redirect_method_runtime(307);
+        rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::new(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+        )));
+        rt.call_function_on_for_cdp(
+            r#"async () => {
+                const response = await fetch("/start", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-Requested-With": "forgerock-sdk",
+                        "Authorization": "Bearer private"
+                    },
+                    body: "payload"
+                });
+                await response.text();
+            }"#,
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, "POST");
+        assert_eq!(events[0].post_data.as_deref(), Some("payload"));
+        let header = |name: &str| events[0].request_headers.iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(header("content-type"), Some("application/json"));
+        assert_eq!(header("x-requested-with"), Some("forgerock-sdk"));
+        assert_eq!(header("authorization"), None);
+        assert!(rt.take_js_network_events().is_empty());
+
+        let wire_requests = wire_requests.lock().unwrap();
+        assert!(wire_requests[0].starts_with("POST /start "));
+        assert!(wire_requests[1].starts_with("POST /final "));
     }
 
     /// Serves `count` requests on a fresh loopback origin and forwards each raw

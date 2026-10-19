@@ -95,12 +95,62 @@ pub struct JsNetworkEvent {
     pub intercepted: bool,
     pub url: String,
     pub method: String,
+    /// UTF-8 request body exposed through CDP's request.postData field. Large,
+    /// empty, or binary bodies are omitted to keep the event queue bounded.
+    pub post_data: Option<String>,
+    /// Bounded non-sensitive application headers for CDP request correlation.
+    pub request_headers: HashMap<String, String>,
     pub resource_type: String,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
     pub timestamp: f64,
     pub error_text: Option<String>,
+}
+
+const CDP_POST_DATA_MAX_BYTES: usize = 64 * 1024;
+const CDP_REQUEST_HEADER_MAX_COUNT: usize = 64;
+const CDP_REQUEST_HEADER_MAX_NAME_BYTES: usize = 256;
+const CDP_REQUEST_HEADER_MAX_VALUE_BYTES: usize = 4 * 1024;
+const CDP_REQUEST_HEADERS_MAX_BYTES: usize = 16 * 1024;
+
+fn cdp_post_data(body: &[u8]) -> Option<String> {
+    if body.is_empty() || body.len() > CDP_POST_DATA_MAX_BYTES {
+        return None;
+    }
+    std::str::from_utf8(body).ok().map(str::to_owned)
+}
+
+fn cdp_request_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut entries = headers.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut captured = HashMap::new();
+    let mut captured_bytes = 0usize;
+    for (name, value) in entries {
+        if captured.len() >= CDP_REQUEST_HEADER_MAX_COUNT {
+            break;
+        }
+        if name.is_empty()
+            || name.len() > CDP_REQUEST_HEADER_MAX_NAME_BYTES
+            || value.len() > CDP_REQUEST_HEADER_MAX_VALUE_BYTES
+            || name.eq_ignore_ascii_case("cookie")
+            || name.eq_ignore_ascii_case("authorization")
+            || name.eq_ignore_ascii_case("proxy-authorization")
+        {
+            continue;
+        }
+        let entry_bytes = name.len().saturating_add(value.len());
+        if captured_bytes.saturating_add(entry_bytes) > CDP_REQUEST_HEADERS_MAX_BYTES {
+            continue;
+        }
+        captured.insert(name.clone(), value.clone());
+        captured_bytes += entry_bytes;
+    }
+    captured
 }
 
 #[cfg(feature = "render")]
@@ -3980,11 +4030,15 @@ async fn fetch_url_inner(
     }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
+    let initial_request_headers: HashMap<String, String> =
+        serde_json::from_str(&headers_json).unwrap_or_default();
     let mut network_guard = FetchNetworkGuard {
         state: Rc::downgrade(state.borrow().borrow::<SharedState>()),
         event: Some(JsNetworkEvent {
             request_id: request_id.clone(), intercepted: false,
             url: url.clone(), method: method.clone(), status: 0,
+            post_data: cdp_post_data(&body),
+            request_headers: cdp_request_headers(&initial_request_headers),
             resource_type: resource_type_name.to_string(),
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
         }),
@@ -3999,10 +4053,8 @@ async fn fetch_url_inner(
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
-    let mut was_intercepted = false;
     if let Some(tx) = intercept_tx {
-        let custom_headers: HashMap<String, String> =
-            serde_json::from_str(&headers_json).unwrap_or_default();
+        let custom_headers = initial_request_headers.clone();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
@@ -4014,7 +4066,6 @@ async fn fetch_url_inner(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
-            was_intercepted = true;
             network_guard.event.as_mut().unwrap().intercepted = true;
             match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
@@ -4032,6 +4083,8 @@ async fn fetch_url_inner(
                         request_id: request_id.clone(), intercepted: true,
                         error_text: None,
                         url: url.clone(), method: method.clone(), status,
+                        post_data: cdp_post_data(&body),
+                        request_headers: cdp_request_headers(&custom_headers),
                         resource_type: resource_type_name.to_string(),
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -4175,8 +4228,11 @@ async fn fetch_url_inner(
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
-    let custom_headers: std::collections::HashMap<String, String> =
-        override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    let custom_headers = override_headers.unwrap_or(initial_request_headers);
+    if let Some(event) = network_guard.event.as_mut() {
+        event.post_data = cdp_post_data(&body);
+        event.request_headers = cdp_request_headers(&custom_headers);
+    }
 
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
@@ -4573,15 +4629,17 @@ async fn fetch_url_inner(
             }
         }
         if let Some(state) = body_state.upgrade() {
-            record_js_network_completion(&state, JsNetworkEvent {
-                request_id, intercepted: was_intercepted,
-                error_text: None,
-                url: current_url, method: current_method.as_str().to_string(), status,
-                resource_type: resource_type_name.to_string(),
-                response_headers: resp_headers, body_size: resp_bytes.len(),
-                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_secs_f64(),
-            }, &String::from_utf8_lossy(&resp_bytes), false);
+            let mut event = network_guard.event.take().unwrap();
+            event.url = current_url;
+            event.method = current_method.as_str().to_string();
+            event.post_data = cdp_post_data(&current_body);
+            event.request_headers = cdp_request_headers(&current_headers);
+            event.status = status;
+            event.response_headers = resp_headers;
+            event.body_size = resp_bytes.len();
+            event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs_f64();
+            record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
         }
         network_guard.event = None;
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
@@ -4861,6 +4919,8 @@ async fn stealth_fetch_all(
             let mut event = network_guard.event.take().unwrap();
             event.url = current_url;
             event.method = current_method;
+            event.post_data = cdp_post_data(&current_body);
+            event.request_headers = cdp_request_headers(&current_headers);
             event.status = status;
             event.response_headers = resp_headers;
             event.body_size = resp_bytes.len();
@@ -4903,15 +4963,49 @@ pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        CDP_POST_DATA_MAX_BYTES, CDP_REQUEST_HEADER_MAX_COUNT, CDP_REQUEST_HEADERS_MAX_BYTES,
         FetchCredentials, LOCAL_STORAGE_ORIGIN_COUNT_LIMIT, LOCAL_STORAGE_ORIGIN_LIMIT,
         LOCAL_STORAGE_TOTAL_LIMIT, ObscuraState, OriginStorage, cors_response_allows,
-        cors_unsafe_request_header_names,
+        cdp_post_data, cdp_request_headers, cors_unsafe_request_header_names,
         glob_match, is_cors_safelisted_content_type, is_cors_safelisted_request_header,
         parse_cors_header_list, preflight_allows_header, preflight_allows_method,
         sanitize_redirect_headers, sends_origin_header, validate_fetch_url,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn cdp_request_metadata_is_bounded_and_omits_credentials() {
+        assert_eq!(cdp_post_data(br#"{"probe":true}"#).as_deref(), Some(r#"{"probe":true}"#));
+        assert_eq!(cdp_post_data(&vec![b'a'; CDP_POST_DATA_MAX_BYTES]).unwrap().len(),
+            CDP_POST_DATA_MAX_BYTES);
+        assert!(cdp_post_data(&vec![b'a'; CDP_POST_DATA_MAX_BYTES + 1]).is_none());
+        assert!(cdp_post_data(&[0xff, 0xfe]).is_none());
+        assert!(cdp_post_data(&[]).is_none());
+
+        let mut headers = HashMap::from([
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("X-Requested-With".to_string(), "forgerock-sdk".to_string()),
+            ("Authorization".to_string(), "Bearer private".to_string()),
+            ("Cookie".to_string(), "session=private".to_string()),
+            ("Proxy-Authorization".to_string(), "Basic private".to_string()),
+        ]);
+        for index in 0..(CDP_REQUEST_HEADER_MAX_COUNT + 10) {
+            headers.insert(format!("x-test-{index:03}"), "value".to_string());
+        }
+        headers.insert("x-oversized".to_string(), "x".repeat(CDP_REQUEST_HEADERS_MAX_BYTES));
+
+        let captured = cdp_request_headers(&headers);
+        assert_eq!(captured.get("Content-Type").map(String::as_str), Some("application/json"));
+        assert_eq!(captured.get("X-Requested-With").map(String::as_str), Some("forgerock-sdk"));
+        assert!(!captured.keys().any(|name| name.eq_ignore_ascii_case("authorization")));
+        assert!(!captured.keys().any(|name| name.eq_ignore_ascii_case("cookie")));
+        assert!(!captured.keys().any(|name| name.eq_ignore_ascii_case("proxy-authorization")));
+        assert!(!captured.contains_key("x-oversized"));
+        assert!(captured.len() <= CDP_REQUEST_HEADER_MAX_COUNT);
+        assert!(captured.iter().map(|(name, value)| name.len() + value.len()).sum::<usize>()
+            <= CDP_REQUEST_HEADERS_MAX_BYTES);
+    }
 
     #[test]
     fn origin_header_matches_classic_script_and_cors_fetch_semantics() {
