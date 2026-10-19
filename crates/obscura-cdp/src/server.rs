@@ -1517,13 +1517,17 @@ fn emit_routed_intercepted_request(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    let request = json!({
+    let mut request = json!({
         "url": intercepted.url,
         "method": intercepted.method,
         "headers": intercepted.headers,
         "initialPriority": "High",
         "referrerPolicy": "strict-origin-when-cross-origin",
     });
+    if let Some(post_data) = intercepted.post_data {
+        request["hasPostData"] = json!(true);
+        request["postData"] = json!(post_data);
+    }
     let request_will_be_sent = json!({
         "method": "Network.requestWillBeSent",
         "params": {
@@ -2486,7 +2490,8 @@ mod tests {
         let (resolver, _resolution) = tokio::sync::oneshot::channel();
         let intercepted = obscura_js::ops::InterceptedRequest {
             request_id: "fetch-1".into(), page_id: page.clone(), url: "https://example.test/data".into(),
-            method: "GET".into(), headers: Default::default(), resource_type: "Fetch".into(), resolver,
+            method: "POST".into(), headers: Default::default(), post_data: Some(r#"{"probe":true}"#.into()),
+            resource_type: "Fetch".into(), resolver,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut paused = HashMap::new();
@@ -2498,8 +2503,12 @@ mod tests {
         assert_eq!(observer["method"], driver["method"]);
         assert_eq!(observer["params"], driver["params"]);
         assert_eq!(observer["sessionId"], "observer");
+        assert_eq!(driver["params"]["request"]["hasPostData"], true);
+        assert_eq!(driver["params"]["request"]["postData"], r#"{"probe":true}"#);
         assert_eq!(pause["method"], "Fetch.requestPaused");
         assert_eq!(pause["sessionId"], "driver");
+        assert_eq!(pause["params"]["request"]["hasPostData"], true);
+        assert_eq!(pause["params"]["request"]["postData"], r#"{"probe":true}"#);
         assert_eq!(paused.len(), 1);
         assert!(paused.contains_key("fetch-1"));
         assert!(rx.try_recv().is_err());
@@ -3606,7 +3615,8 @@ mod tests {
             intercept_tx.send(InterceptedRequest {
                 page_id: page_id.clone(),
                 request_id: "pending-test".into(), url: format!("http://{address}/pending"),
-                method: "GET".into(), headers: HashMap::new(), resource_type: "Fetch".into(),
+                method: "GET".into(), headers: HashMap::new(), post_data: None,
+                resource_type: "Fetch".into(),
                 resolver: resolution_tx,
             }).unwrap();
             loop {

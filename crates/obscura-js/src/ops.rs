@@ -70,6 +70,9 @@ pub struct InterceptedRequest {
     pub url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
+    /// Bounded UTF-8 request body for the standard CDP request projection.
+    /// This is retained only while the request is paused for interception.
+    pub post_data: Option<String>,
     pub resource_type: String,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
 }
@@ -4062,6 +4065,7 @@ async fn fetch_url_inner(
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
+            post_data: cdp_post_data(&body),
             resource_type: resource_type_name.to_string(),
             resolver: resolve_tx,
         };
